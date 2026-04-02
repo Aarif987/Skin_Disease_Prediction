@@ -41,18 +41,115 @@ def preprocess_metadata(age, gender, localization):
 def is_human_skin(filepath):
     try:
         img = cv2.imread(filepath)
+        img = cv2.resize(img, (224, 224))
+        
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower1 = np.array([0, 10, 30], dtype=np.uint8)
-        upper1 = np.array([30, 255, 255], dtype=np.uint8)
-        lower2 = np.array([160, 10, 30], dtype=np.uint8)
-        upper2 = np.array([179, 255, 255], dtype=np.uint8)
+        lower1 = np.array([0, 20, 70], dtype=np.uint8)
+        upper1 = np.array([20, 255, 255], dtype=np.uint8)
+        lower2 = np.array([170, 20, 70], dtype=np.uint8)
+        upper2 = np.array([180, 255, 255], dtype=np.uint8)
         mask1 = cv2.inRange(hsv, lower1, upper1)
         mask2 = cv2.inRange(hsv, lower2, upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
-        skin_percentage = (np.sum(mask > 0) / mask.size) * 100
-        return skin_percentage >= 5.0
-    except:
-        return True
+        skin_mask = cv2.bitwise_or(mask1, mask2)
+        skin_percentage = (np.count_nonzero(skin_mask) / skin_mask.size) * 100.0
+        
+        if skin_percentage < 15.0:
+            return False, "Invalid color"
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = (np.sum(edges == 255) / edges.size) * 100.0
+        
+        if edge_density > 12.0:
+            return False, "Invalid texture detected"
+
+        smooth = cv2.bilateralFilter(gray, 7, 40, 40)
+        smooth = cv2.medianBlur(smooth, 7)
+        blackhat = cv2.morphologyEx(
+            smooth,
+            cv2.MORPH_BLACKHAT,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        )
+        _, lesion_mask = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        lesion_mask = cv2.bitwise_and(lesion_mask, skin_mask)
+        lesion_mask = cv2.morphologyEx(
+            lesion_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        )
+
+        line_h = cv2.morphologyEx(
+            lesion_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (27, 1))
+        )
+        line_v = cv2.morphologyEx(
+            lesion_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 27))
+        )
+        diag1_kernel = np.eye(21, dtype=np.uint8)
+        diag2_kernel = np.fliplr(diag1_kernel)
+        line_d1 = cv2.morphologyEx(lesion_mask, cv2.MORPH_OPEN, diag1_kernel)
+        line_d2 = cv2.morphologyEx(lesion_mask, cv2.MORPH_OPEN, diag2_kernel)
+        line_mask = cv2.bitwise_or(cv2.bitwise_or(line_h, line_v), cv2.bitwise_or(line_d1, line_d2))
+
+        lesion_mask = cv2.bitwise_and(lesion_mask, cv2.bitwise_not(line_mask))
+        lesion_mask = cv2.morphologyEx(
+            lesion_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        )
+
+        contours, _ = cv2.findContours(lesion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        lesion_found = False
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 90 or area > 5000:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w == 0 or h == 0:
+                continue
+            aspect_ratio = w / float(h)
+            if aspect_ratio < 0.35 or aspect_ratio > 2.8:
+                continue
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter <= 0:
+                continue
+            circularity = (4.0 * np.pi * area) / (perimeter * perimeter)
+            extent = area / float(w * h)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area <= 0:
+                continue
+            solidity = area / hull_area
+
+            lesion_region_mask = np.zeros_like(gray, dtype=np.uint8)
+            cv2.drawContours(lesion_region_mask, [cnt], -1, 255, -1)
+            local_ring_mask = cv2.dilate(
+                lesion_region_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1
+            )
+            local_ring_mask = cv2.subtract(local_ring_mask, lesion_region_mask)
+            lesion_pixels = gray[lesion_region_mask == 255]
+            ring_pixels = gray[local_ring_mask == 255]
+            
+            if lesion_pixels.size == 0 or ring_pixels.size == 0:
+                continue
+            contrast = float(np.mean(ring_pixels) - np.mean(lesion_pixels))
+
+            if circularity > 0.12 and extent > 0.28 and solidity > 0.52 and contrast > 8.0:
+                lesion_found = True
+                break
+
+        if not lesion_found:
+            return False, "Healthy skin"
+
+        return True, "Valid"
+    except Exception:
+        return True, "Validation Skipped"
 
 def get_gradcam_heatmap(img_array, meta_array, model):
     grad_model = tf.keras.models.Model(
@@ -94,8 +191,9 @@ def predict():
     filepath = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(filepath)
 
-    if not is_human_skin(filepath):
-        return jsonify({'diagnosis': 'Invalid Image', 'confidence': '0%', 'error_message': 'Please upload a valid image of a skin lesion.', 'heatmap_url': None})
+    is_valid_skin, validation_message = is_human_skin(filepath)
+    if not is_valid_skin:
+        return jsonify({'diagnosis': 'Invalid Image', 'confidence': '0%', 'error_message': validation_message, 'heatmap_url': None})
 
     img = load_img(filepath, target_size=(224, 224))
     img_array = np.expand_dims(img_to_array(img) / 255.0, axis=0)
